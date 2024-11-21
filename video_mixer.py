@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import librosa
 import numpy as np
 from moviepy.editor import VideoFileClip, concatenate_videoclips
+from datetime import datetime
 
 # 设置日志
 logging.basicConfig(level=logging.DEBUG)
@@ -40,22 +41,45 @@ class VideoProcessor(QThread):
             self.status.emit(f"正在处理视频: {os.path.basename(video_path)}")
             logger.debug(f"开始处理视频: {video_path}")
             
+            # 打开视频文件
             video = VideoFileClip(video_path)
+            if video is None or video.reader is None:
+                logger.error(f"无法打开视频文件: {video_path}")
+                return []
+
             if video.audio is None:
-                logger.error("视频没有音频轨道")
-                raise ValueError("视频文件没有音频轨道")
+                logger.warning("视频没有音频轨道，使用固定时间间隔分割")
+                # 使用固定时间间隔分割
+                split_points = np.arange(0, video.duration, 3.0)
+            else:
+                # 提取音频数据
+                self.status.emit("正在提取音频数据...")
+                logger.debug("开始提取音频数据")
                 
-            audio = video.audio
+                # 使用librosa直接加载音频
+                y, sr = librosa.load(video_path, sr=22050, mono=True)
+                
+                # 获取分割点
+                self.status.emit("正在分析音频...")
+                logger.debug("开始音频分析")
+                
+                # 使用多个特征来检测语音段
+                onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+                tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+                split_points = librosa.frames_to_time(beats, sr=sr)
             
-            # 提取音频数据
-            self.status.emit("正在提取音频数据...")
-            logger.debug("开始提取音频数据")
-            audio_array = audio.to_soundarray(fps=22050)  # 指定采样率
-            if len(audio_array.shape) > 1:
-                audio_array = audio_array.mean(axis=1)  # 转换为单声道
-                
-            # 获取分割点
-            split_points = self.analyze_audio(audio_array, 22050)  # 使用相同的采样率
+            # 确保至少有一个分割点
+            if len(split_points) < 2:
+                logger.debug("未检测到足够的分割点，使用固定时间间隔")
+                # 如果没有检测到足够的分割点，每3秒分割一次
+                split_points = np.arange(0, video.duration, 3.0)
+            
+            # 确保最后一个分割点不超过视频时长
+            split_points = split_points[split_points < video.duration]
+            
+            # 如果没有包含视频结尾，添加结尾时间点
+            if len(split_points) == 0 or split_points[-1] < video.duration:
+                split_points = np.append(split_points, video.duration)
             
             # 生成视频片段
             self.status.emit("正在分割视频片段...")
@@ -63,81 +87,144 @@ class VideoProcessor(QThread):
             total_points = len(split_points) - 1
             
             for i in range(total_points):
-                if split_points[i+1] - split_points[i] > 0.5:  # 只保留长度超过0.5秒的片段
+                start_time = split_points[i]
+                end_time = split_points[i + 1]
+                
+                # 确保片段长度合适
+                if end_time - start_time > 0.5 and end_time - start_time < 10.0:  # 限制最大片段长度为10秒
                     try:
-                        clip = video.subclip(split_points[i], split_points[i+1])
-                        clips.append(clip)
-                        self.progress.emit(int((i + 1) / total_points * 30))
+                        clip = video.subclip(start_time, end_time)
+                        if clip is not None and clip.reader is not None:
+                            # 验证片段是否可以读取帧
+                            test_frame = clip.get_frame(0)
+                            if test_frame is not None:
+                                clip.filename = video_path  # 保存原始文件路径
+                                clips.append(clip)
+                                self.progress.emit(int((i + 1) / total_points * 30))
+                                logger.debug(f"成功创建片段 {i+1}/{total_points}, 时长: {end_time - start_time:.2f}秒")
                     except Exception as e:
                         logger.error(f"分割片段失败 {i}: {str(e)}")
                         continue
-                        
+            
             video.close()
+            
+            if not clips:
+                logger.warning("没有生成任何有效片段")
+                return []
+                
             logger.debug(f"视频分割完成，得到 {len(clips)} 个片段")
             return clips
+            
         except Exception as e:
             logger.error(f"视频分割失败: {str(e)}")
+            if 'video' in locals():
+                try:
+                    video.close()
+                except:
+                    pass
             raise
         
     def run(self):
         try:
+            if not self.video_files:
+                raise ValueError("没有选择视频文件")
+
             all_clips = []
-            for i, video_file in enumerate(self.video_files):
+            total_files = len(self.video_files)
+
+            for i, video_path in enumerate(self.video_files):
                 try:
-                    clips = self.split_video(video_file)
-                    all_clips.extend(clips)
-                    base_progress = 30 + int((i + 1) / len(self.video_files) * 20)
-                    self.progress.emit(base_progress)
+                    clips = self.split_video(video_path)
+                    if clips:  # 确保有有效的片段
+                        all_clips.extend(clips)
                 except Exception as e:
-                    logger.error(f"处理视频文件失败 {video_file}: {str(e)}")
+                    logger.error(f"处理视频文件失败 {video_path}: {str(e)}")
                     continue
-                    
+
             if not all_clips:
                 raise ValueError("没有可用的视频片段")
-                
-            # 随机打乱并选择片段
-            self.status.emit("正在混合视频片段...")
-            logger.debug(f"开始混合 {len(all_clips)} 个视频片段")
+
+            # 随机选择并组合片段
+            self.status.emit("正在组合视频片段...")
             random.shuffle(all_clips)
-            total_duration = 0
-            final_clips = []
+            
+            # 计算目标时长（30-60秒）
             target_duration = random.uniform(30, 60)
+            final_clips = []
+            current_duration = 0
             
+            # 验证并选择片段
             for clip in all_clips:
-                if total_duration + clip.duration <= target_duration:
-                    final_clips.append(clip)
-                    total_duration += clip.duration
-                if total_duration >= target_duration:
-                    break
-                    
+                try:
+                    if clip is not None and hasattr(clip, 'duration') and clip.reader is not None:
+                        # 验证片段是否可以读取帧
+                        test_frame = clip.get_frame(0)
+                        if test_frame is not None:
+                            clip_duration = clip.duration
+                            if current_duration + clip_duration <= target_duration:
+                                final_clips.append(clip)
+                                current_duration += clip_duration
+                            if current_duration >= target_duration:
+                                break
+                except Exception as e:
+                    logger.error(f"验证片段失败: {str(e)}")
+                    continue
+
             if not final_clips:
-                raise ValueError("无法生成足够的视频片段")
-                
-            # 合成最终视频
+                raise ValueError("无法创建足够长度的视频")
+
+            # 确保所有片段都是有效的
+            valid_clips = []
+            for clip in final_clips:
+                try:
+                    # 重新打开视频片段
+                    new_clip = VideoFileClip(clip.filename)
+                    if new_clip is not None and new_clip.reader is not None:
+                        valid_clips.append(new_clip)
+                except Exception as e:
+                    logger.error(f"重新打开片段失败: {str(e)}")
+                    continue
+
+            if not valid_clips:
+                raise ValueError("没有有效的视频片段")
+
+            # 创建最终视频
             self.status.emit("正在生成最终视频...")
-            logger.debug(f"开始合成最终视频，使用 {len(final_clips)} 个片段")
-            final_video = concatenate_videoclips(final_clips)
-            output_path = os.path.join(os.path.dirname(self.video_files[0]), 'mixed_video.mp4')
+            final_video = concatenate_videoclips(valid_clips)
             
-            def write_callback(t):
-                progress = int(50 + t * 50)
-                self.progress.emit(min(progress, 100))
+            # 生成输出文件名
+            output_dir = os.path.dirname(self.video_files[0])
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(output_dir, f"mixed_video_{timestamp}.mp4")
             
-            final_video.write_videofile(output_path,
-                                      codec='libx264',
-                                      audio_codec='aac',
-                                      callback=write_callback)
+            # 写入文件
+            self.status.emit("正在写入文件...")
+            final_video.write_videofile(
+                output_path,
+                codec='libx264',
+                audio_codec='aac',
+                temp_audiofile=None,
+                remove_temp=True,
+                fps=24
+            )
             
+            # 清理资源
+            final_video.close()
+            for clip in valid_clips:
+                try:
+                    clip.close()
+                except:
+                    pass
+
+            self.status.emit(f"处理完成！输出文件：{output_path}")
             self.progress.emit(100)
-            self.status.emit("处理完成！")
-            logger.debug("视频处理完成")
-            self.finished.emit(output_path)
             
         except Exception as e:
             logger.error(f"处理过程出错: {str(e)}")
-            self.status.emit(f"处理出错：{str(e)}")
-            self.finished.emit("")
-            
+            self.status.emit(f"处理失败: {str(e)}")
+            self.progress.emit(0)
+            raise
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
